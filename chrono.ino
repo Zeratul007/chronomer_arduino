@@ -4,26 +4,33 @@
 const byte GATE1_PIN = 2; // PB2, physical pin 7
 const byte GATE2_PIN = 3; // PB3, physical pin 2
 const byte LED_PIN   = 1; // PB1, physical pin 6
+const byte BUTTON_PIN = 0; // PB0, physical pin 5
 
+enum State : byte {
+  CALIBRATION,
+  ARMED,
+  RESULT
+};
+
+volatile State state = CALIBRATION;
 volatile uint32_t overflowCount = 0;
 volatile uint32_t startTicks = 0;
 volatile uint32_t elapsedTicks = 0;
-
 volatile bool started = false;
-volatile bool measurementReady = false;
+volatile bool measurementValid = false;
+volatile uint8_t previousPins = 0;
 
-// Timer1 overflows every 256 ticks.
 ISR(TIMER1_OVF_vect) {
   overflowCount++;
 }
 
-// Call from an ISR, where global interrupts are already disabled.
+// Called from an ISR; global interrupts are already disabled.
 uint32_t getTimerTicks() {
   uint32_t overflows = overflowCount;
   uint8_t count = TCNT1;
 
-  // An overflow may have happened before its ISR could run.
-  if ((TIFR & (1 << TOV1)) && count < 255) {
+  // Handle a pending overflow that hasn't been serviced yet.
+  if (TIFR & (1 << TOV1)) {
     overflows++;
     count = TCNT1;
   }
@@ -31,10 +38,7 @@ uint32_t getTimerTicks() {
   return overflows * 256UL + count;
 }
 
-// PB2 and PB3 share this pin-change interrupt.
 ISR(PCINT0_vect) {
-  static uint8_t previousPins = 0;
-
   uint8_t currentPins = PINB;
 
   bool gate1Fell =
@@ -47,65 +51,130 @@ ISR(PCINT0_vect) {
 
   previousPins = currentPins;
 
-  if (measurementReady) return;
+  if (state != ARMED) return;
 
-  if (!started && gate1Fell) {
+  if (!started && gate2Fell) {
+    // Wrong order: Gate 2 triggered first.
+    measurementValid = false;
+    state = RESULT;
+  }
+  else if (!started && gate1Fell) {
     startTicks = getTimerTicks();
     started = true;
   }
   else if (started && gate2Fell) {
     elapsedTicks = getTimerTicks() - startTicks;
-    measurementReady = true;
+    measurementValid = true;
+    state = RESULT;
   }
+}
+
+void enterCalibration() {
+  cli();
+  state = CALIBRATION;
+  started = false;
+  measurementValid = false;
+  previousPins = PINB;
+  sei();
+}
+
+bool buttonPressed() {
+  static byte lastReading = HIGH;
+  static byte stableState = HIGH;
+  static uint32_t lastChange = 0;
+
+  byte reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastReading) {
+    lastChange = millis();
+    lastReading = reading;
+  }
+
+  if (millis() - lastChange >= 25 &&
+      reading != stableState) {
+    stableState = reading;
+
+    if (stableState == LOW) return true;
+  }
+
+  return false;
 }
 
 void setup() {
   pinMode(GATE1_PIN, INPUT);
   pinMode(GATE2_PIN, INPUT);
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   cli();
 
-  // Stop Timer1 while configuring it.
+  // Configure Timer1: synchronous CPU clock / 8.
   TCCR1 = 0;
   TCNT1 = 0;
   overflowCount = 0;
-
-  // Clear any pending Timer1 overflow flag.
   TIFR = (1 << TOV1);
-
-  // Enable Timer1 overflow interrupt.
   TIMSK |= (1 << TOIE1);
+  TCCR1 = (1 << CS13);
 
-  // Initialize the previous pin state before enabling interrupts.
+  // Set initial gate states before enabling interrupts.
+  previousPins = PINB;
   PCMSK |= (1 << PCINT2) | (1 << PCINT3);
   GIFR = (1 << PCIF);
   GIMSK |= (1 << PCIE);
-
-  // Synchronous CPU clock / 8.
-  // At 8 MHz CPU clock, Timer1 runs at 1 MHz.
-  TCCR1 = (1 << CS13);
 
   sei();
 }
 
 void loop() {
-  if (measurementReady) {
-    // Copy the 32-bit result atomically.
-    cli();
-    uint32_t result = elapsedTicks;
-    sei();
-
-    // A completed measurement turns the LED on.
-    digitalWrite(LED_PIN, HIGH);
-
-    // For now, inspect 'result' with a debugger.
-    // The expected unit is timer ticks (nominally 1 us).
-    (void)result;
-
-    while (true) {
-      // One-shot test. Reset the ATtiny to measure again.
+  if (buttonPressed()) {
+    if (state == CALIBRATION) {
+      // Only arm when both beams are clear.
+      if (!(PINB & (1 << PB2)) &&
+          !(PINB & (1 << PB3))) {
+        cli();
+        started = false;
+        measurementValid = false;
+        previousPins = PINB;
+        state = ARMED;
+        sei();
+      }
+    } else {
+      // Abort or return from result to calibration.
+      enterCalibration();
     }
   }
+
+  State currentState = state;
+  uint32_t result = 0;
+  bool valid = false;
+
+  if (currentState == RESULT) {
+    cli();
+    result = elapsedTicks;
+    valid = measurementValid;
+    sei();
+  }
+
+  // Status LED behavior:
+  // CALIBRATION: on if either gate is blocked.
+  // ARMED: blink.
+  // RESULT: solid for valid measurement, blink fast if invalid.
+  if (currentState == CALIBRATION) {
+    bool blocked = (PINB & (1 << PB2)) ||
+                   (PINB & (1 << PB3));
+    digitalWrite(LED_PIN, blocked ? HIGH : LOW);
+  }
+  else if (currentState == ARMED) {
+    digitalWrite(LED_PIN, (millis() / 250) % 2);
+  }
+  else if (valid) {
+    digitalWrite(LED_PIN, HIGH);
+  }
+  else {
+    digitalWrite(LED_PIN, (millis() / 100) % 2);
+  }
+
+  // Inspect result in a debugger for now.
+  // At 8 MHz CPU clock, each timer tick is nominally 1 us.
+  (void)result;
 }
